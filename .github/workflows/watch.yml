@@ -1,0 +1,50 @@
+name: doomsday-watch
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # GitHub may delay scheduled runs by a few minutes
+  workflow_dispatch:        # "Run workflow" button for manual checks
+    inputs:
+      mode:
+        description: "check = normal check, test = send a test alert"
+        type: choice
+        options: [check, test]
+        default: check
+
+concurrency:
+  group: watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # seen.json remembers which shows were already alerted, across runs.
+      - uses: actions/cache/restore@v4
+        with:
+          path: seen.json
+          key: seen-${{ github.run_id }}
+          restore-keys: seen-
+
+      - name: Check District
+        run: |
+          if [ "${{ inputs.mode }}" = "test" ]; then
+            python3 watch.py --test-notify
+          else
+            python3 watch.py --once --formats english
+          fi
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: seen.json
+          key: seen-${{ github.run_id }}
