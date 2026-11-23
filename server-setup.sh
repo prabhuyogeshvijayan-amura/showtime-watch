@@ -39,6 +39,8 @@ echo "== 3/4  Alert settings (Telegram + Gmail) =="
 KEEP=n
 if [ -f "$ENVF" ]; then ask "Saved alert settings found. Keep them? [Y/n] " KEEP; KEEP=${KEEP:-y}; fi
 if [[ ! "$KEEP" =~ ^[Yy] ]]; then
+  # The running bot polls Telegram too; pause it so we can read your chat id.
+  systemctl stop $SVC 2>/dev/null || true
   echo
   echo "Telegram: in the Telegram app open @BotFather, send /newbot, follow the prompts,"
   echo "copy the token it gives you, then open your new bot and send it any message (e.g. hi)."

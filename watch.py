@@ -5,13 +5,15 @@ Watch District (district.in) for Avengers: Doomsday shows at Phoenix Market City
 
 Stdlib only - no pip installs.
 
-  python3 watch.py                  # loop forever, check every ~3 min
-  python3 watch.py --once           # one check + alerts, then exit (used by GitHub Actions)
+  python3 watch.py                  # loop forever, check every ~3 min (+ Telegram bot for subscribers)
+  python3 watch.py --once           # one check + alerts, then exit
   python3 watch.py --dry-run        # one check, print only, no alerts
-  python3 watch.py --test-notify    # send a test alert on every configured channel
+  python3 watch.py --test-notify    # send a test alert to the owner and exit
 
 Alert channels (enabled by setting env vars):
-  Telegram : TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+  Telegram : TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID (the owner's chat)
+             Anyone who messages the bot (/start) is subscribed to "shows open" alerts;
+             /status shows the latest check, /stop unsubscribes. Loop mode only.
   Email    : SMTP_USER, SMTP_PASS, EMAIL_TO   (optional SMTP_HOST=smtp.gmail.com, SMTP_PORT=465)
   ntfy     : NTFY_TOPIC
   macOS pop-up/sound is used automatically when running on a Mac.
@@ -25,6 +27,7 @@ import re
 import smtplib
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -36,10 +39,14 @@ FORMATS = {"english": "Mm5dpqTqJz", "tamil": "chjP5dFQh1"}
 CINEMA_MATCH = "phoenix market city"
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0 Safari/537.36")
-STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seen.json")
+HERE = os.path.dirname(os.path.abspath(__file__))
+STATE_FILE = os.path.join(HERE, "seen.json")
+SUBS_FILE = os.path.join(HERE, "subscribers.json")
 NEXT_DATA_RE = re.compile(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.S)
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
-HEARTBEAT_HOUR_IST = 9  # one "still watching" message per day after this hour
+HEARTBEAT_HOUR_IST = 9  # one "still watching" message per day (owner only) after this hour
+
+LAST_STATUS = {"text": "No check has run yet - try again in a few minutes."}
 
 
 def now_ist():
@@ -123,17 +130,128 @@ def check(after_date, formats):
     return results, elsewhere
 
 
-# ---------- notifications ----------
+# ---------- Telegram (owner + subscribers) ----------
 
-def send_telegram(text):
-    token, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
-    if not (token and chat):
+class Subscribers:
+    """Chat ids that messaged the bot. Thread-safe, persisted to subscribers.json."""
+
+    def __init__(self, path):
+        self.path, self.lock = path, threading.Lock()
+        try:
+            with open(path) as f:
+                self.ids = {int(x) for x in json.load(f)}
+        except (FileNotFoundError, json.JSONDecodeError, ValueError, TypeError):
+            self.ids = set()
+
+    def _save(self):
+        with open(self.path, "w") as f:
+            json.dump(sorted(self.ids), f)
+
+    def add(self, cid):
+        with self.lock:
+            if cid in self.ids:
+                return False
+            self.ids.add(cid)
+            self._save()
+            return True
+
+    def remove(self, cid):
+        with self.lock:
+            if cid in self.ids:
+                self.ids.discard(cid)
+                self._save()
+
+    def all(self):
+        with self.lock:
+            return set(self.ids)
+
+
+SUBS = Subscribers(SUBS_FILE)
+
+
+def tg_api(method, params, timeout=20):
+    token = os.environ["TELEGRAM_BOT_TOKEN"]
+    data = urllib.parse.urlencode(params).encode()
+    with urllib.request.urlopen(f"https://api.telegram.org/bot{token}/{method}", data,
+                                timeout=timeout) as r:
+        return json.load(r)
+
+
+def tg_send(chat_id, text):
+    tg_api("sendMessage", {"chat_id": chat_id, "text": text, "disable_web_page_preview": "true"})
+
+
+def owner_id():
+    try:
+        return int(os.environ.get("TELEGRAM_CHAT_ID", ""))
+    except ValueError:
+        return None
+
+
+def send_telegram(text, everyone=False):
+    owner = owner_id()
+    if not (os.environ.get("TELEGRAM_BOT_TOKEN") and owner):
         return False
-    data = urllib.parse.urlencode({"chat_id": chat, "text": text,
-                                   "disable_web_page_preview": "true"}).encode()
-    urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", data, timeout=20).read()
+    tg_send(owner, text)
+    if everyone:
+        for cid in SUBS.all() - {owner}:
+            try:
+                tg_send(cid, text)
+            except urllib.error.HTTPError as e:
+                if e.code in (400, 403):  # user blocked the bot / chat gone
+                    SUBS.remove(cid)
+                    log(f"  removed subscriber {cid} (HTTP {e.code})")
+                else:
+                    log(f"  subscriber {cid} send failed: {e!r}")
+            except Exception as e:
+                log(f"  subscriber {cid} send failed: {e!r}")
+            time.sleep(0.05)
     return True
 
+
+def welcome_text(after):
+    return ("✅ You're subscribed!\n\n"
+            "You'll get a message here when Avengers: Doomsday (English) shows open at "
+            f"INOX Phoenix Market City, Velachery (Chennai) for dates after {after}. "
+            "Checked every ~3 minutes.\n\n"
+            "/status - latest check\n/stop - unsubscribe")
+
+
+def telegram_listener(after):
+    """Long-poll the bot for /start, /status, /stop from anyone."""
+    started, offset = time.time(), None
+    log("Telegram bot listening for subscribers.")
+    while True:
+        try:
+            params = {"timeout": 50, "allowed_updates": json.dumps(["message"])}
+            if offset is not None:
+                params["offset"] = offset
+            for u in tg_api("getUpdates", params, timeout=65).get("result", []):
+                offset = u["update_id"] + 1
+                m = u.get("message") or {}
+                chat = m.get("chat") or {}
+                cid = chat.get("id")
+                # Ignore groups and messages sent before this process started.
+                if not cid or chat.get("type") != "private" or m.get("date", 0) < started - 120:
+                    continue
+                cmd = (m.get("text") or "").strip().lower().split("@")[0]
+                who = chat.get("first_name") or chat.get("username") or cid
+                if cmd.startswith("/stop"):
+                    SUBS.remove(cid)
+                    tg_send(cid, "🛑 Unsubscribed. Send /start any time to subscribe again.")
+                    log(f"unsubscribed: {who} ({cid})")
+                elif cmd.startswith("/status"):
+                    tg_send(cid, LAST_STATUS["text"])
+                else:
+                    if SUBS.add(cid):
+                        log(f"new subscriber: {who} ({cid}) - total {len(SUBS.all())}")
+                    tg_send(cid, welcome_text(after))
+        except Exception as e:
+            log(f"telegram listener error: {e!r}")
+            time.sleep(15)
+
+
+# ---------- other channels ----------
 
 def send_email(subject, body):
     user, pw, to = (os.environ.get(k) for k in ("SMTP_USER", "SMTP_PASS", "EMAIL_TO"))
@@ -177,12 +295,13 @@ def mac_alert(title, body, url, open_browser):
         subprocess.Popen(["open", url])
 
 
-def notify(title, body, url=None, open_browser=False, loud=True):
-    """Send on every configured channel. Returns number of channels that worked."""
-    log(f"ALERT: {title} | {body}")
+def notify(title, body, url=None, open_browser=False, loud=True, everyone=False):
+    """Send on every configured channel. everyone=True also sends to Telegram subscribers.
+    Returns number of channels that worked."""
+    log(f"ALERT{' (all subscribers)' if everyone else ''}: {title} | {body}")
     full = f"{title}\n\n{body}" + (f"\n\nBook: {url}" if url else "")
     sent = 0
-    for name, fn in (("telegram", lambda: send_telegram(full)),
+    for name, fn in (("telegram", lambda: send_telegram(full, everyone)),
                      ("email", lambda: send_email(title, body + (f"\n\nBook: {url}" if url else ""))),
                      ("ntfy", lambda: send_ntfy(title, body, url))):
         try:
@@ -214,6 +333,20 @@ def save_state(st):
         json.dump(st, f, indent=1)
 
 
+def status_text(after, sessions, elsewhere):
+    lines = [f"🕒 Last check: {now_ist():%d %b, %I:%M %p} IST", ""]
+    if sessions:
+        lines.append(f"🎬 INOX Phoenix Market City, after {after}:")
+        for s in sorted(sessions, key=lambda x: x["iso"]):
+            lines.append(f"• {s['date']} {s['time']} - {s['avail']} seats free")
+    else:
+        lines.append(f"No shows at INOX Phoenix Market City after {after} yet.")
+    if elsewhere:
+        lines += ["", "Other Chennai cinemas with shows after the cutoff:"]
+        lines += [f"• {d}: {', '.join(sorted(set(v)))}" for d, v in sorted(elsewhere.items())]
+    return "\n".join(lines)
+
+
 def run_cycle(a, formats, st, alerts=True):
     """One check. Returns True on success, False on failure."""
     seen, meta = st["seen"], st["meta"]
@@ -222,7 +355,7 @@ def run_cycle(a, formats, st, alerts=True):
     except (urllib.error.URLError, TimeoutError, RuntimeError, KeyError, ValueError) as e:
         log(f"check failed: {e!r}")
         meta["fail_streak"] = meta.get("fail_streak", 0) + 1
-        # Alert once after 3 consecutive failures, not on every retry.
+        # Alert the owner once after 3 consecutive failures, not on every retry.
         if alerts and meta["fail_streak"] == 3:
             notify("Doomsday watcher problem",
                    f"3 checks in a row failed: {e}. District may be blocking the server or "
@@ -232,6 +365,7 @@ def run_cycle(a, formats, st, alerts=True):
     if alerts and meta.get("fail_streak", 0) >= 3:
         notify("Doomsday watcher recovered", "Checks are working again.", loud=False)
     meta["fail_streak"] = 0
+    LAST_STATUS["text"] = status_text(a.after, sessions, elsewhere)
 
     new, reopened = [], []
     for s in sessions:
@@ -257,16 +391,14 @@ def run_cycle(a, formats, st, alerts=True):
         lines = [f"• {s['date']} {s['time']} {s['screen']} - {s['avail']} seats free" for s in hits[:12]]
         notify(f"🚨 Doomsday @ Phoenix OPEN: {', '.join(dates)}",
                f"{len(hits)} new show(s) at INOX Phoenix Market City:\n" + "\n".join(lines),
-               hits[0]["url"], a.open)
+               hits[0]["url"], a.open, everyone=True)
 
-    # Daily heartbeat so you know it's alive.
+    # Daily heartbeat to the owner so you know it's alive.
     today = now_ist().date().isoformat()
     if meta.get("last_heartbeat") != today and now_ist().hour >= HEARTBEAT_HOUR_IST:
-        other = "; ".join(f"{d}: {', '.join(sorted(set(v)))}" for d, v in sorted(elsewhere.items()))
+        subs = len(SUBS.all() - {owner_id()})
         notify("Doomsday watcher: still watching",
-               "No new Phoenix shows after " + a.after + " yet." +
-               (f"\nOther Chennai cinemas after the cutoff: {other}" if other else ""),
-               loud=False)
+               LAST_STATUS["text"] + f"\n\n👥 Friends subscribed: {subs}", loud=False)
         meta["last_heartbeat"] = today
     return True
 
@@ -279,7 +411,7 @@ def main():
     ap.add_argument("--open", action="store_true", help="on a Mac, also open the booking page on alert")
     ap.add_argument("--once", action="store_true", help="one check with alerts, then exit")
     ap.add_argument("--dry-run", action="store_true", help="one check, print only, no alerts, no state saved")
-    ap.add_argument("--test-notify", action="store_true", help="send a test alert and exit")
+    ap.add_argument("--test-notify", action="store_true", help="send a test alert to the owner and exit")
     a = ap.parse_args()
 
     formats = [f.strip().lower() for f in a.formats.split(",") if f.strip()]
@@ -300,6 +432,9 @@ def main():
         ok = run_cycle(a, formats, st)
         save_state(st)
         sys.exit(0 if ok else 1)
+
+    if os.environ.get("TELEGRAM_BOT_TOKEN"):
+        threading.Thread(target=telegram_listener, args=(a.after,), daemon=True).start()
 
     interval = max(60, a.interval)
     log(f"Watching '{CINEMA_MATCH}' for dates after {a.after} ({', '.join(formats)}), "
