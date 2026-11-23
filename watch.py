@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Watch District (district.in) for Avengers: Doomsday shows at Phoenix Market City
-(INOX, Velachery, Chennai) on dates AFTER a cutoff, and alert when they open.
+(INOX, Velachery, Chennai). Alerts when any NEW show is added from the release date on
+(e.g. extra opening-weekend screens), and when seats free up on shows after a cutoff date.
 
 Stdlib only - no pip installs.
 
@@ -93,7 +94,8 @@ def fetch_sessions(fmt_id, date):
             if s.get("showDate") != date:  # guard against fallback/neighbouring dates
                 continue
             found.append({
-                "key": f"{c.get('id')}-{s.get('sid')}-{date}",
+                # date+time+screen is stabler than District's internal session id
+                "key": f"{c.get('id')}-{s.get('showTimeLocal') or s.get('showTimeISO')}-{s.get('audi')}",
                 "cinema": name,
                 "date": date,
                 "time": s.get("showTimeText"),
@@ -108,26 +110,30 @@ def fetch_sessions(fmt_id, date):
     return show_dates, others, found
 
 
-def check(after_date, formats):
-    """Return (phoenix_sessions_after_cutoff, {date: [other cinemas]})."""
-    first = (dt.date.fromisoformat(after_date) + dt.timedelta(days=1)).isoformat()
+def check(watch_from, after_date, formats):
+    """Return (all Phoenix sessions from watch_from on, {date after cutoff: [other cinemas]})."""
+    first = max(watch_from, now_ist().date().isoformat())  # never ask for past dates
     results, elsewhere = [], {}
     for fmt_name in formats:
         fmt_id = FORMATS[fmt_name]
         show_dates, others, found = fetch_sessions(fmt_id, first)
-        results += found
-        if others:
-            elsewhere.setdefault(first, []).extend(others)
+        per_date = {first: (others, found)}
         # Only fetch later dates that District says have shows somewhere in the city.
         for d in sorted(d for d in show_dates if d > first):
             time.sleep(random.uniform(1.5, 3.5))
-            _, others, found = fetch_sessions(fmt_id, d)
-            results += found
-            if others:
-                elsewhere.setdefault(d, []).extend(others)
-        log(f"{fmt_name}: city show dates after {after_date}: "
-            f"{[d for d in show_dates if d > after_date] or 'none'}")
+            _, o, f = fetch_sessions(fmt_id, d)
+            per_date[d] = (o, f)
+        for d, (o, f) in per_date.items():
+            results += f
+            if d > after_date and o:
+                elsewhere.setdefault(d, []).extend(o)
+        log(f"{fmt_name}: city show dates {show_dates[0] if show_dates else '-'}.."
+            f"{show_dates[-1] if show_dates else '-'}")
     return results, elsewhere
+
+
+def pretty(date):
+    return dt.date.fromisoformat(date).strftime("%a %d %b")
 
 
 # ---------- Telegram (owner + subscribers) ----------
@@ -211,8 +217,9 @@ def send_telegram(text, everyone=False):
 
 def welcome_text(after):
     return ("✅ You're subscribed!\n\n"
-            "You'll get a message here when Avengers: Doomsday (English) shows open at "
-            f"INOX Phoenix Market City, Velachery (Chennai) for dates after {after}. "
+            "You'll get a message here when new Avengers: Doomsday (English) shows are added at "
+            "INOX Phoenix Market City, Velachery (Chennai) - extra opening-weekend shows and the "
+            f"first shows after {pretty(after)} - or when seats free up on shows after {pretty(after)}. "
             "Checked every ~3 minutes.\n\n"
             "/status - latest check\n/stop - unsubscribe")
 
@@ -333,17 +340,26 @@ def save_state(st):
         json.dump(st, f, indent=1)
 
 
+def by_date(sessions):
+    out = {}
+    for s in sessions:
+        out.setdefault(s["date"], []).append(s)
+    return dict(sorted(out.items()))
+
+
 def status_text(after, sessions, elsewhere):
-    lines = [f"🕒 Last check: {now_ist():%d %b, %I:%M %p} IST", ""]
-    if sessions:
-        lines.append(f"🎬 INOX Phoenix Market City, after {after}:")
-        for s in sorted(sessions, key=lambda x: x["iso"]):
-            lines.append(f"• {s['date']} {s['time']} - {s['avail']} seats free")
-    else:
-        lines.append(f"No shows at INOX Phoenix Market City after {after} yet.")
+    lines = [f"🕒 Last check: {now_ist():%d %b, %I:%M %p} IST", "",
+             "🎬 INOX Phoenix Market City (English):"]
+    for d, ss in by_date(sessions).items():
+        free = sum(s["avail"] for s in ss)
+        screens = len({s["screen"] for s in ss})
+        lines.append(f"• {pretty(d)}: {len(ss)} shows on {screens} screen(s) - "
+                     + (f"{free} seats free" if free else "sold out"))
+    if not any(s["date"] > after for s in sessions):
+        lines.append(f"• Nothing after {pretty(after)} yet.")
     if elsewhere:
-        lines += ["", "Other Chennai cinemas with shows after the cutoff:"]
-        lines += [f"• {d}: {', '.join(sorted(set(v)))}" for d, v in sorted(elsewhere.items())]
+        lines += ["", f"Other Chennai cinemas with shows after {pretty(after)}:"]
+        lines += [f"• {pretty(d)}: {', '.join(sorted(set(v)))}" for d, v in sorted(elsewhere.items())]
     return "\n".join(lines)
 
 
@@ -351,7 +367,7 @@ def run_cycle(a, formats, st, alerts=True):
     """One check. Returns True on success, False on failure."""
     seen, meta = st["seen"], st["meta"]
     try:
-        sessions, elsewhere = check(a.after, formats)
+        sessions, elsewhere = check(a.watch_from, a.after, formats)
     except (urllib.error.URLError, TimeoutError, RuntimeError, KeyError, ValueError) as e:
         log(f"check failed: {e!r}")
         meta["fail_streak"] = meta.get("fail_streak", 0) + 1
@@ -367,30 +383,41 @@ def run_cycle(a, formats, st, alerts=True):
     meta["fail_streak"] = 0
     LAST_STATUS["text"] = status_text(a.after, sessions, elsewhere)
 
+    # First run with this watch window: quietly record the existing opening-weekend shows
+    # so only shows added from now on trigger alerts.
+    baseline = meta.get("baseline_from") != a.watch_from
     new, reopened = [], []
     for s in sessions:
         prev = seen.get(s["key"])
         if prev is None:
-            new.append(s)
-        elif prev.get("avail", 0) == 0 and s["avail"] > 0:
+            if not (baseline and s["date"] <= a.after):
+                new.append(s)
+        elif s["date"] > a.after and prev.get("avail", 0) == 0 and s["avail"] > 0:
+            # Seat-back alerts only after the cutoff; opening-weekend seats flicker constantly.
             reopened.append(s)
         seen[s["key"]] = {k: s[k] for k in ("date", "time", "avail", "status")}
+    if baseline and alerts:
+        meta["baseline_from"] = a.watch_from
+        log(f"Baseline recorded: {sum(1 for s in sessions if s['date'] <= a.after)} existing "
+            f"shows up to {a.after} (no alerts for these).")
 
-    for s in sorted(sessions, key=lambda x: x["iso"]):
-        log(f"  PHOENIX {s['date']} {s['time']} {s['lang']} {s['screen']} "
-            f"- {s['avail']}/{s['total']} free ({s['status']})")
-    if not sessions:
-        log("No Phoenix Market City shows after the cutoff yet.")
+    for d, ss in by_date(sessions).items():
+        log(f"  PHOENIX {d}: {len(ss)} shows on {len({s['screen'] for s in ss})} screen(s), "
+            f"{sum(s['avail'] for s in ss)} seats free")
+    if not any(s["date"] > a.after for s in sessions):
+        log(f"No Phoenix Market City shows after {a.after} yet.")
 
     if not alerts:
         return True
 
-    hits = sorted(new + reopened, key=lambda x: x["iso"])
-    if hits:
-        dates = sorted({s["date"] for s in hits})
-        lines = [f"• {s['date']} {s['time']} {s['screen']} - {s['avail']} seats free" for s in hits[:12]]
-        notify(f"🚨 Doomsday @ Phoenix OPEN: {', '.join(dates)}",
-               f"{len(hits)} new show(s) at INOX Phoenix Market City:\n" + "\n".join(lines),
+    if new or reopened:
+        hits = sorted(new + reopened, key=lambda x: x["iso"])
+        dates = ", ".join(pretty(d) for d in sorted({s["date"] for s in hits}))
+        title = (f"🚨 New Doomsday shows @ Phoenix: {dates}" if new
+                 else f"🎟 Seats free again @ Phoenix: {dates}")
+        lines = [f"• {pretty(s['date'])} {s['time']} {s['screen']} - {s['avail']} seats free"
+                 + (" (NEW)" if s in new and reopened else "") for s in hits[:15]]
+        notify(title, "INOX Phoenix Market City, Velachery:\n" + "\n".join(lines),
                hits[0]["url"], a.open, everyone=True)
 
     # Daily heartbeat to the owner so you know it's alive.
@@ -405,7 +432,10 @@ def run_cycle(a, formats, st, alerts=True):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--after", default="2026-12-20", help="alert only for dates after this (YYYY-MM-DD)")
+    ap.add_argument("--from", dest="watch_from", default="2026-12-17",
+                    help="alert on any NEW show from this date on (YYYY-MM-DD; release date)")
+    ap.add_argument("--after", default="2026-12-20",
+                    help="for dates after this, also alert when sold-out shows get seats back")
     ap.add_argument("--formats", default="english", help="comma list: english,tamil")
     ap.add_argument("--interval", type=int, default=180, help="seconds between checks in loop mode (min 60)")
     ap.add_argument("--open", action="store_true", help="on a Mac, also open the booking page on alert")
