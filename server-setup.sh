@@ -105,7 +105,7 @@ echo "Sending a test alert..."
 ( set -a; . "$ENVF"; set +a; python3 "$DIR/watch.py" --test-notify )
 
 echo
-echo "Done. The watcher checks every ~3 minutes and survives reboots."
+echo "Done. The watcher checks every ~2 minutes and survives reboots."
 echo "  Live log : sudo journalctl -u $SVC -f"
 echo "  Status   : systemctl status $SVC"
 echo "  Stop     : sudo systemctl disable --now $SVC"

@@ -6,7 +6,7 @@ Watch District (district.in) for Avengers: Doomsday shows at Phoenix Market City
 
 Stdlib only - no pip installs.
 
-  python3 watch.py                  # loop forever, check every ~3 min (+ Telegram bot for subscribers)
+  python3 watch.py                  # loop forever, check every ~2 min (+ Telegram bot for subscribers)
   python3 watch.py --once           # one check + alerts, then exit
   python3 watch.py --dry-run        # one check, print only, no alerts
   python3 watch.py --test-notify    # send a test alert to the owner and exit
@@ -220,7 +220,7 @@ def welcome_text(after):
             "You'll get a message here when new Avengers: Doomsday (English) shows are added at "
             "INOX Phoenix Market City, Velachery (Chennai) - extra opening-weekend shows and the "
             f"first shows after {pretty(after)} - or when seats free up on shows after {pretty(after)}. "
-            "Checked every ~3 minutes.\n\n"
+            "Checked every ~2 minutes.\n\n"
             "/status - latest check\n/stop - unsubscribe")
 
 
@@ -437,7 +437,8 @@ def main():
     ap.add_argument("--after", default="2026-12-20",
                     help="for dates after this, also alert when sold-out shows get seats back")
     ap.add_argument("--formats", default="english", help="comma list: english,tamil")
-    ap.add_argument("--interval", type=int, default=180, help="seconds between checks in loop mode (min 60)")
+    ap.add_argument("--interval", type=int, default=120,
+                    help="seconds from the start of one check to the next in loop mode (min 60)")
     ap.add_argument("--open", action="store_true", help="on a Mac, also open the booking page on alert")
     ap.add_argument("--once", action="store_true", help="one check with alerts, then exit")
     ap.add_argument("--dry-run", action="store_true", help="one check, print only, no alerts, no state saved")
@@ -470,10 +471,14 @@ def main():
     log(f"Watching '{CINEMA_MATCH}' for dates after {a.after} ({', '.join(formats)}), "
         f"every ~{interval}s. Ctrl+C to stop.")
     while True:
+        started = time.time()
         ok = run_cycle(a, formats, st)
         save_state(st)
-        wait = interval if ok else min(interval * 2 ** st["meta"]["fail_streak"], 900)
-        time.sleep(wait + random.uniform(0, 30))
+        if ok:  # keep a steady start-to-start rhythm regardless of how long the check took
+            wait = max(30, interval - (time.time() - started))
+        else:   # back off if District is failing/blocking, so we don't make it worse
+            wait = min(interval * 2 ** st["meta"]["fail_streak"], 900)
+        time.sleep(wait + random.uniform(0, 15))
 
 
 if __name__ == "__main__":
