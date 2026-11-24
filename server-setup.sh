@@ -36,16 +36,23 @@ chown -R showtime: "$DIR"
 sudo -u showtime python3 "$DIR/watch.py" --dry-run
 
 echo "== 3/4  Alert settings (Telegram + Gmail) =="
-KEEP=n
-if [ -f "$ENVF" ]; then ask "Saved alert settings found. Keep them? [Y/n] " KEEP; KEEP=${KEEP:-y}; fi
-if [[ ! "$KEEP" =~ ^[Yy] ]]; then
+TELEGRAM_BOT_TOKEN=""; TELEGRAM_CHAT_ID=""; SMTP_USER=""; SMTP_PASS=""; EMAIL_TO=""
+# shellcheck disable=SC1090
+if [ -f "$ENVF" ]; then . "$ENVF"; fi
+
+# --- Telegram ---
+DO_TG=y
+if [ -n "$TELEGRAM_BOT_TOKEN" ]; then
+  ask "Telegram alerts are set up. Change them? [y/N] " DO_TG; DO_TG=${DO_TG:-n}
+fi
+if [[ "$DO_TG" =~ ^[Yy] ]]; then
   # The running bot polls Telegram too; pause it so we can read your chat id.
   systemctl stop $SVC 2>/dev/null || true
   echo
   echo "Telegram: in the Telegram app open @BotFather, send /newbot, follow the prompts,"
   echo "copy the token it gives you, then open your new bot and send it any message (e.g. hi)."
-  asks "Bot token (hidden): " TG_TOKEN
-  CHAT_ID=$(curl -s "https://api.telegram.org/bot${TG_TOKEN}/getUpdates" | python3 -c '
+  asks "Bot token (hidden): " TELEGRAM_BOT_TOKEN
+  TELEGRAM_CHAT_ID=$(curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates" | python3 -c '
 import sys, json
 r = json.load(sys.stdin)
 if not r.get("ok"):
@@ -54,28 +61,54 @@ msgs = [u["message"] for u in r["result"] if "message" in u]
 if not msgs:
     sys.exit("No messages found - send your bot a message in Telegram, then re-run this script.")
 print(msgs[-1]["chat"]["id"])')
-  echo "Telegram chat id: $CHAT_ID"
-  echo
-  echo "Gmail: create an App Password at https://myaccount.google.com/apppasswords"
-  echo "(needs 2-Step Verification turned on). Leave the address blank to skip email."
-  ask "Gmail address to send from: " GM_USER
-  GM_PASS=""; GM_TO=""
-  if [ -n "$GM_USER" ]; then
-    asks "16-letter App Password (hidden): " GM_PASS
-    GM_PASS=${GM_PASS// /}
-    ask "Send alerts to [$GM_USER]: " GM_TO
-    GM_TO=${GM_TO:-$GM_USER}
-  fi
-  umask 077
-  cat > "$ENVF" <<EOF
-TELEGRAM_BOT_TOKEN="$TG_TOKEN"
-TELEGRAM_CHAT_ID="$CHAT_ID"
-SMTP_USER="$GM_USER"
-SMTP_PASS="$GM_PASS"
-EMAIL_TO="$GM_TO"
-EOF
-  chmod 600 "$ENVF"
+  echo "Telegram chat id: $TELEGRAM_CHAT_ID"
 fi
+
+# --- Email ---
+echo
+if [ -n "$SMTP_USER" ]; then
+  ask "Email alerts are on (to $EMAIL_TO). Change them? [y/N] " DO_EM
+else
+  ask "Add email alerts too? [y/N] " DO_EM
+fi
+DO_EM=${DO_EM:-n}
+if [[ "$DO_EM" =~ ^[Yy] ]]; then
+  echo "Gmail: create an App Password at https://myaccount.google.com/apppasswords"
+  echo "(needs 2-Step Verification turned on). Leave the address blank to turn email off."
+  ask "Gmail address to send from: " SMTP_USER
+  SMTP_PASS=""; EMAIL_TO=""
+  if [ -n "$SMTP_USER" ]; then
+    asks "16-letter App Password (hidden): " SMTP_PASS
+    SMTP_PASS=${SMTP_PASS// /}
+    ask "Send alerts to [$SMTP_USER] (several? separate with commas): " EMAIL_TO
+    EMAIL_TO=${EMAIL_TO:-$SMTP_USER}
+    echo "Checking the Gmail login..."
+    if SMTP_USER="$SMTP_USER" SMTP_PASS="$SMTP_PASS" python3 -c '
+import os, smtplib, sys
+try:
+    s = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20)
+    s.login(os.environ["SMTP_USER"], os.environ["SMTP_PASS"])
+    s.quit()
+except Exception as e:
+    sys.exit("Gmail said: %s" % (getattr(e, "smtp_error", b"").decode(errors="replace") or e))'; then
+      echo "Gmail login OK."
+    else
+      echo "Gmail rejected that address/App Password. Email is left OFF (Telegram still works)."
+      echo "Re-run 'sudo bash setup.sh' to try again."
+      SMTP_USER=""; SMTP_PASS=""; EMAIL_TO=""
+    fi
+  fi
+fi
+
+umask 077
+cat > "$ENVF" <<EOF
+TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN"
+TELEGRAM_CHAT_ID="$TELEGRAM_CHAT_ID"
+SMTP_USER="$SMTP_USER"
+SMTP_PASS="$SMTP_PASS"
+EMAIL_TO="$EMAIL_TO"
+EOF
+chmod 600 "$ENVF"
 
 echo "== 4/4  Starting the always-on service =="
 cat > /etc/systemd/system/$SVC.service <<EOF
