@@ -113,7 +113,7 @@ chmod 600 "$ENVF"
 echo "== 4/4  Starting the always-on service =="
 cat > /etc/systemd/system/$SVC.service <<EOF
 [Unit]
-Description=Showtime watcher (Avengers Doomsday @ Phoenix Market City)
+Description=Showtime watcher (Doomsday + Dune IMAX @ Phoenix Market City)
 After=network-online.target
 Wants=network-online.target
 
@@ -122,7 +122,7 @@ User=showtime
 WorkingDirectory=$DIR
 EnvironmentFile=$ENVF
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/python3 $DIR/watch.py --formats english
+ExecStart=/usr/bin/python3 $DIR/watch.py
 Restart=always
 RestartSec=60
 
@@ -138,7 +138,7 @@ echo "Sending a test alert..."
 ( set -a; . "$ENVF"; set +a; python3 "$DIR/watch.py" --test-notify )
 
 echo
-echo "Done. The watcher checks every ~2 minutes and survives reboots."
+echo "Done. The watcher checks Doomsday (English) and Dune (IMAX) every ~2 minutes and survives reboots."
 echo "  Live log : sudo journalctl -u $SVC -f"
 echo "  Status   : systemctl status $SVC"
 echo "  Stop     : sudo systemctl disable --now $SVC"
